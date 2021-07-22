@@ -423,19 +423,19 @@ enum NfaState {
 
     // All states below are DFA states.
     StartRecord = 0,
-    StartField = 1,
-    InField = 2,
-    InQuotedField = 3,
-    InEscapedQuote = 4,
-    InDoubleEscapedQuote = 5,
-    InComment = 6,
+    StartField = 6,
+    InField = 18,
+    InQuotedField = 24,
+    InEscapedQuote = 30,
+    InDoubleEscapedQuote = 36,
+    InComment = 42,
     // All states below are "final field" states.
     // Namely, they indicate that a field has been parsed.
-    EndFieldDelim = 7,
+    EndFieldDelim = 12,
     // All states below are "final record" states.
     // Namely, they indicate that a record has been parsed.
-    EndRecord = 8,
-    CRLF = 9,
+    EndRecord = 48,
+    CRLF = 54,
 }
 
 /// A list of NFA states that have an explicit representation in the DFA.
@@ -483,7 +483,7 @@ impl Reader {
     ///
     /// This may be useful when reading CSV data in a random access pattern.
     pub fn reset(&mut self) {
-        self.dfa_state = self.dfa.new_state(NfaState::StartRecord);
+        self.dfa_state = DfaState(0);
         self.nfa_state = NfaState::StartRecord;
         self.line = 1;
         self.has_read = false;
@@ -665,9 +665,9 @@ impl Reader {
         let (mut nin, mut nout, mut nend) = (0, 0, 0);
         let mut state = self.dfa_state;
         while nin < input.len() && nout < output.len() && nend < ends.len() {
-            let (s, has_out) = self.dfa.get_output(state, input[nin]);
+            let has_out = self.dfa.get_output(&mut state.0, input[nin]);
             self.line += (input[nin] == b'\n') as u64;
-            state = s;
+            // state = s;
             if has_out {
                 output[nout] = input[nin];
                 nout += 1;
@@ -726,8 +726,8 @@ impl Reader {
         while nin < input.len() && nout < output.len() {
             let b = input[nin];
             self.line += (b == b'\n') as u64;
-            let (s, has_out) = self.dfa.get_output(state, b);
-            state = s;
+            let has_out = self.dfa.get_output(&mut state.0, b);
+            //state = s;
             if has_out {
                 output[nout] = b;
                 nout += 1;
@@ -755,9 +755,9 @@ impl Reader {
         // and never move from there. (pro-tip: the start state doubles as
         // the final state!)
         if state >= self.dfa.final_record || state.is_start() {
-            self.dfa.new_state_final_end()
+            DfaState(0)
         } else {
-            self.dfa.new_state_final_record()
+            DfaState(48)
         }
     }
 
@@ -802,47 +802,73 @@ impl Reader {
         // Even though this requires an extra bit of indirection when computing
         // the next transition, microbenchmarks say that it doesn't make much
         // of a difference. Perhaps because everything fits into the L1 cache.
-        self.dfa.classes.add(self.delimiter);
+
+        //self.dfa.classes.add(self.delimiter);
+        //if self.quoting {
+        //    self.dfa.classes.add(self.quote);
+        //    if let Some(escape) = self.escape {
+        //        self.dfa.classes.add(escape);
+        //    }
+        //}
+        //if let Some(comment) = self.comment {
+        //    self.dfa.classes.add(comment);
+        //}
+        //match self.term {
+        //    Terminator::Any(b) => self.dfa.classes.add(b),
+        //    Terminator::CRLF => {
+        //        self.dfa.classes.add(b'\r');
+        //        self.dfa.classes.add(b'\n');
+        //    }
+        //    _ => unreachable!(),
+        //}
+
+        // Modify "transition table"
+        self.dfa.classes.classes[self.delimiter as usize] = 768613923678759594;       // delim
         if self.quoting {
-            self.dfa.classes.add(self.quote);
+            if self.double_quote {
+                self.dfa.classes.classes[self.quote as usize] = 329407381127087250;  // double quote
+            } else {
+                self.dfa.classes.classes[self.quote as usize] = 329407374684636306;  // quote
+            }
             if let Some(escape) = self.escape {
-                self.dfa.classes.add(escape);
+                self.dfa.classes.classes[escape as usize] = 219605745486840588;  // escape
             }
         }
         if let Some(comment) = self.comment {
-            self.dfa.classes.add(comment);
+            self.dfa.classes.classes[comment as usize] = 658706709153891108;  // comment
+            self.dfa.classes.classes[b'\n' as usize] = 219603271584105228;    // newline leaves comment
         }
         match self.term {
-            Terminator::Any(b) => self.dfa.classes.add(b),
+            Terminator::Any(b) => self.dfa.classes.classes[b as usize] = 213631980211200,  // terminator
             Terminator::CRLF => {
-                self.dfa.classes.add(b'\r');
-                self.dfa.classes.add(b'\n');
+                self.dfa.classes.classes[b'\n' as usize] = 211158079048704;  // CRLF newline
+                self.dfa.classes.classes[b'\r' as usize] = 240026701753728;  // CRLF Term,
             }
             _ => unreachable!(),
         }
+
         // Build the DFA transition table by computing the DFA state for all
         // possible combinations of state and input byte.
-        for &state in NFA_STATES {
-            for c in (0..256).map(|c| c as u8) {
-                let mut nfa_result = (state, NfaInputAction::Epsilon);
-                // Consume NFA states until we hit a non-epsilon transition.
-                while nfa_result.0 != NfaState::End
-                    && nfa_result.1 == NfaInputAction::Epsilon
-                {
-                    nfa_result = self.transition_nfa(nfa_result.0, c);
-                }
-                let from = self.dfa.new_state(state);
-                let to = self.dfa.new_state(nfa_result.0);
-                self.dfa.set(
-                    from,
-                    c,
-                    to,
-                    nfa_result.1 == NfaInputAction::CopyToOutput,
-                );
-            }
-        }
-        self.dfa_state = self.dfa.new_state(NfaState::StartRecord);
-        self.dfa.finish();
+        //for &state in NFA_STATES {
+        //    for c in (0..256).map(|c| c as u8) {
+        //        let mut nfa_result = (state, NfaInputAction::Epsilon);
+        //        // Consume NFA states until we hit a non-epsilon transition.
+        //        while nfa_result.0 != NfaState::End
+        //            && nfa_result.1 == NfaInputAction::Epsilon
+        //        {
+        //            nfa_result = self.transition_nfa(nfa_result.0, c);
+        //        }
+        //        let from = self.dfa.new_state(state);
+        //        let to = self.dfa.new_state(nfa_result.0);
+        //        self.dfa.set(
+        //            from,
+        //            c,
+        //            to,
+        //            nfa_result.1 == NfaInputAction::CopyToOutput,
+        //        );
+        //}
+        self.dfa_state = DfaState(0);
+        //self.dfa.finish();
     }
 
     // The NFA implementation follows. The transition_final_nfa and
@@ -1105,7 +1131,7 @@ struct Dfa {
     ///
     /// DFA states are represented as an index corresponding to the start of
     /// its row in this table.
-    trans: [DfaState; TRANS_SIZE],
+    //trans: [DfaState; TRANS_SIZE],
     /// A table with the same layout as `trans`, except its values indicate
     /// whether a particular `(state, equivalence class)` pair should emit an
     /// output byte.
@@ -1130,19 +1156,19 @@ struct Dfa {
 impl Dfa {
     fn new() -> Dfa {
         Dfa {
-            trans: [DfaState(0); TRANS_SIZE],
+            //trans: [DfaState(0); TRANS_SIZE],
             has_output: [false; TRANS_SIZE],
             classes: DfaClasses::new(),
-            in_field: DfaState(0),
-            in_quoted: DfaState(0),
-            final_field: DfaState(0),
-            final_record: DfaState(0),
+            in_field: DfaState(12),
+            in_quoted: DfaState(18),
+            final_field: DfaState(42),
+            final_record: DfaState(48),
         }
     }
 
     fn new_state(&self, nfa_state: NfaState) -> DfaState {
-        let nclasses = self.classes.num_classes() as u8;
-        let idx = (nfa_state as u8).checked_mul(nclasses).unwrap();
+        let nclasses = self.classes.num_classes() as u64;
+        let idx = (nfa_state as u64).checked_mul(nclasses).unwrap();
         DfaState(idx)
     }
 
@@ -1154,16 +1180,24 @@ impl Dfa {
         self.new_state(NfaState::EndRecord)
     }
 
-    fn get_output(&self, state: DfaState, c: u8) -> (DfaState, bool) {
+    #[inline(always)]
+    fn get_output(&self, state: &mut u64, c: u8) -> bool {
         let cls = self.classes.classes[c as usize];
-        let idx = state.0 as usize + cls as usize;
-        (self.trans[idx], self.has_output[idx])
+        *state = (cls >>  *state) & 63;
+        //let idx = state.0 as usize + cls as usize;
+        //self.has_output[1])
+
+        match *state {
+            12 => true,
+            18 => true,
+            _  => false
+        } 
     }
 
     fn set(&mut self, from: DfaState, c: u8, to: DfaState, output: bool) {
         let cls = self.classes.classes[c as usize];
         let idx = from.0 as usize + cls as usize;
-        self.trans[idx] = to;
+        //self.trans[idx] = to;
         self.has_output[idx] = output;
     }
 
@@ -1224,20 +1258,21 @@ impl Dfa {
 
 /// A map from input byte to equivalence class.
 struct DfaClasses {
-    classes: [u8; CLASS_SIZE],
+    classes: [u64; CLASS_SIZE],
     next_class: usize,
 }
 
 impl DfaClasses {
     fn new() -> DfaClasses {
-        DfaClasses { classes: [0; CLASS_SIZE], next_class: 1 }
+        DfaClasses { classes: [219605745485267724; CLASS_SIZE], next_class: 1 }
     }
+
 
     fn add(&mut self, b: u8) {
         if self.next_class > CLASS_SIZE {
             panic!("added too many classes")
         }
-        self.classes[b as usize] = self.next_class as u8;
+        //self.classes[b as usize] = self.next_class as u64;
         self.next_class = self.next_class + 1;
     }
 
@@ -1265,7 +1300,7 @@ impl DfaClasses {
     ) {
         while *nin < input.len()
             && *nout < output.len()
-            && self.classes[input[*nin] as usize] == 0
+            && self.classes[input[*nin] as usize] == 28875371889414
         {
             output[*nout] = input[*nin];
             *nin += 1;
@@ -1281,7 +1316,7 @@ impl DfaClasses {
 /// single multiplication instruction when computing the next transition for
 /// a particular input byte.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct DfaState(u8);
+struct DfaState(u64);
 
 impl DfaState {
     fn start() -> DfaState {
@@ -1311,8 +1346,8 @@ impl fmt::Debug for DfaClasses {
 
 impl Clone for Dfa {
     fn clone(&self) -> Dfa {
-        let mut dfa = Dfa::new();
-        dfa.trans.copy_from_slice(&self.trans);
+        let dfa = Dfa::new();
+        //dfa.trans.copy_from_slice(&self.trans);
         dfa
     }
 }
